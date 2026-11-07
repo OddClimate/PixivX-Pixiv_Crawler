@@ -1,4 +1,5 @@
 # PixivX
+<img width="1242" height="852" alt="image" src="https://github.com/user-attachments/assets/3253fcb2-61e8-4ae6-b4a7-bfae26ae8415" />
 Pixiv 日榜 / 周榜 / 月榜 / 新人榜 桌面客户端，支持勾选下载、原图预览、代理与免代理镜像源。
 > !部分AI代码注意
 > 仅用于个人学习与备份，请遵守 Pixiv 的服务条款，并积极支持原插画画师。

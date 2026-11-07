@@ -1,0 +1,3 @@
+requests[socks]>=2.31
+Pillow>=10.0
+ttkbootstrap>=2.2

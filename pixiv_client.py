@@ -178,11 +178,14 @@ def system_is_dark():
         return False
 
 
-def fetch_ranking(mode, content=RANKING_CONTENT, limit=RANKING_LIMIT):
+def fetch_ranking(mode, content=RANKING_CONTENT, limit=RANKING_LIMIT,
+                  should_stop=None):
     """官方源：分页拉取榜单，返回带元信息的条目列表。"""
     entries, seen = [], set()
     page = 1
     while len(entries) < limit:
+        if should_stop is not None and should_stop():
+            break
         url = (f"{core.RANKING_URL}?format=json&mode={mode}&content={content}"
                f"&p={page}")
         r = core.get_with_retry(url)
@@ -221,7 +224,7 @@ def fetch_ranking(mode, content=RANKING_CONTENT, limit=RANKING_LIMIT):
 
 
 def fetch_ranking_mirror(mode, api_base, image_mirror,
-                         limit=RANKING_LIMIT, timeout=30):
+                         limit=RANKING_LIMIT, timeout=30, should_stop=None):
     """镜像源：从 pixivic 后端接口拉日/周/月榜（无需代理）。"""
     mirror_mode = MIRROR_MODES.get(mode)
     if not mirror_mode:
@@ -233,9 +236,13 @@ def fetch_ranking_mirror(mode, api_base, image_mirror,
     dates = [time.strftime("%Y-%m-%d", time.localtime(now - 86400 * i))
              for i in range(4)]
     for date in dates:
+        if should_stop is not None and should_stop():
+            return []
         entries, seen = [], set()
         page = 1
         while len(entries) < limit:
+            if should_stop is not None and should_stop():
+                return entries[:limit]
             url = f"{base}/ranks?date={date}&mode={mirror_mode}&page={page}&size=30"
             r = core.session.get(url, timeout=timeout)
             r.raise_for_status()
@@ -503,8 +510,13 @@ class PixivClient:
         self.downloading = False
         self.pool = None
         self._preview_ref = None  # 防止 PhotoImage 被垃圾回收
-        self._preview_cache = {}
+        self._preview_sources = {}  # pid -> 原始 PIL 图，供自适应缩放
+        self._preview_pid = None
+        self._preview_fit_job = None
+        self._preview_last_size = None
         self._hover_iid = None
+        self._refresh_gen = 0
+        self._refresh_cancel = None
         self.closing = False
         # 后台线程 → UI 线程的唯一通道。tkinter 不是线程安全的，
         # 工作线程只往队列里塞回调，由主线程定时取出执行。
@@ -774,6 +786,7 @@ class PixivClient:
         self.preview_label = tb.Label(right, text="选择左侧作品查看预览",
                                       anchor="center", justify="center")
         self.preview_label.pack(fill="both", expand=True)
+        self.preview_label.bind("<Configure>", self._on_preview_resize)
 
         self.info_label = tb.Label(right, text="", anchor="nw", justify="left",
                                    wraplength=380)
@@ -819,9 +832,6 @@ class PixivClient:
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
         self._post(_do)
-
-    def set_status(self, text):
-        self._post(lambda: self.status_var.set(text))
 
     def _set_checked_label(self):
         self.checked_label.configure(text=f"已勾选 {len(self.checked)} 个")
@@ -1042,42 +1052,61 @@ class PixivClient:
 
     # ---------------- 列表与勾选 ----------------
     def refresh(self):
-        if self.loading or self.downloading:
+        if self.downloading:
             return
+        # 取消上一次仍在进行的加载：切换榜单不用等旧请求结束
+        if self._refresh_cancel is not None:
+            self._refresh_cancel.set()
+        self._refresh_gen += 1
+        gen = self._refresh_gen
+        cancel = threading.Event()
+        self._refresh_cancel = cancel
+
         self.loading = True
-        self.refresh_btn.configure(state="disabled")
         self.clear_tree()
         self.checked.clear()
-        self._preview_cache.clear()
+        self._preview_sources.clear()
+        self._preview_pid = None
+        self._preview_last_size = None
+        self._preview_ref = None
+        self.preview_label.configure(image="", text="选择左侧作品查看预览")
         self._set_checked_label()
-        self.status_var.set("正在获取榜单…")
-        self._start_indeterminate()
         mode = self.current_mode()
         mode_label = self.mode_var.get()
+        self.status_var.set(f"正在获取{mode_label}…")
         self.log(f"获取{mode_label}…")
+        self._start_indeterminate()
 
         def work():
             try:
                 source = self.resolve_source()
+                if cancel.is_set():
+                    return
                 if source == "mirror":
                     entries = fetch_ranking_mirror(
                         mode, self.config.get("mirror_api", ""),
-                        self.config.get("mirror_img", ""))
+                        self.config.get("mirror_img", ""),
+                        should_stop=cancel.is_set)
                     source_label = "镜像"
                 else:
-                    entries = fetch_ranking(mode)
+                    entries = fetch_ranking(mode, should_stop=cancel.is_set)
                     source_label = "官方"
-                self._post(lambda: self.render_entries(entries, source_label))
+                if cancel.is_set() or gen != self._refresh_gen:
+                    return  # 已被更新的请求取代，丢弃结果
+                self._post(lambda: self.render_entries(entries, source_label, gen))
             except Exception as e:
                 err = str(e)
-                self._post(lambda err=err: self.on_refresh_error(err))
+                if cancel.is_set() or gen != self._refresh_gen:
+                    return
+                self._post(lambda err=err: self.on_refresh_error(err, gen))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def on_refresh_error(self, err):
+    def on_refresh_error(self, err, gen=None):
+        if gen is not None and gen != self._refresh_gen:
+            return
         self.loading = False
         self._stop_indeterminate()
-        self.refresh_btn.configure(state="normal")
         self.status_var.set("获取榜单失败")
         self.log(f"[错误] 获取榜单失败：{err}")
         messagebox.showerror("获取失败", f"无法获取榜单：\n{err}")
@@ -1086,10 +1115,11 @@ class PixivClient:
         for iid in self.tree.get_children():
             self.tree.delete(iid)
 
-    def render_entries(self, entries, source_label):
+    def render_entries(self, entries, source_label, gen=None):
+        if gen is not None and gen != self._refresh_gen:
+            return  # 旧请求的结果，忽略
         self.loading = False
         self._stop_indeterminate()
-        self.refresh_btn.configure(state="normal")
         self.entries = entries
         self.entries_by_pid = {e["pid"]: e for e in entries}
         for e in entries:
@@ -1170,10 +1200,11 @@ class PixivClient:
             f"页数: {entry['pages']}\n"
             f"标签: {', '.join(entry['tags']) if entry['tags'] else '—'}"
         ))
-        cached = self._preview_cache.get(pid)
+        cached = self._preview_sources.get(pid)
         if cached is not None:
-            self._preview_ref = cached
-            self.preview_label.configure(image=cached, text="")
+            self._preview_pid = pid
+            self._preview_last_size = None
+            self._fit_preview()
             return
         self.preview_label.configure(text="加载预览中…", image="")
         # 镜像条目：优先用原始地址 + 主/备域名依次尝试
@@ -1196,7 +1227,8 @@ class PixivClient:
                                          verify=False, timeout=(10, 60))
                     r.raise_for_status()
                     img = Image.open(BytesIO(r.content))
-                    img.thumbnail((440, 580))
+                    img.load()
+                    img.thumbnail((1600, 1600))  # 限制缓存内存，自适应缩放用
                     # PhotoImage 必须回到主线程创建，否则 Tk 会报错
                     self._post(lambda img=img: self.show_preview(pid, img))
                     return
@@ -1210,12 +1242,50 @@ class PixivClient:
         threading.Thread(target=work, daemon=True).start()
 
     def show_preview(self, pid, img):
+        # 缓存源图（最多 6 张），之后缩放/调整窗口都不用重新下载
+        self._preview_sources[pid] = img
+        while len(self._preview_sources) > 6:
+            self._preview_sources.pop(next(iter(self._preview_sources)))
         # 用户可能已经点了别的行，避免旧请求覆盖
         sel = self.tree.selection()
         if not sel or sel[0] != pid:
             return
+        self._preview_pid = pid
+        self._preview_last_size = None
+        self._fit_preview()
+
+    def _on_preview_resize(self, _event=None):
+        # 拖动窗口/分隔条时防抖，避免每像素都重算缩放
+        if self._preview_fit_job is not None:
+            try:
+                self.root.after_cancel(self._preview_fit_job)
+            except Exception:
+                pass
+        self._preview_fit_job = self.root.after(120, self._fit_preview)
+
+    def _fit_preview(self):
+        self._preview_fit_job = None
+        if self._preview_pid is None:
+            return
+        src = self._preview_sources.get(self._preview_pid)
+        if src is None:
+            return
+        w = self.preview_label.winfo_width()
+        h = self.preview_label.winfo_height()
+        if w <= 30 or h <= 30:  # 布局还没完成，稍后再试
+            self._preview_fit_job = self.root.after(100, self._fit_preview)
+            return
+        avail_w, avail_h = max(50, w - 12), max(50, h - 12)
+        scale = min(avail_w / src.width, avail_h / src.height)
+        if scale <= 0:
+            return
+        size = (max(1, int(src.width * scale)),
+                max(1, int(src.height * scale)))
+        if size == self._preview_last_size:
+            return
+        self._preview_last_size = size
+        img = src if size == src.size else src.resize(size, Image.LANCZOS)
         photo = ImageTk.PhotoImage(img)
-        self._preview_cache[pid] = photo
         self._preview_ref = photo
         self.preview_label.configure(image=photo, text="")
 
@@ -1317,6 +1387,13 @@ class PixivClient:
 
     def _finish_download(self, status, log_msg):
         self.downloading = False
+        # 所有任务已结束，释放线程池
+        if self.pool is not None:
+            try:
+                self.pool.shutdown(wait=False)
+            except Exception:
+                pass
+            self.pool = None
         self.stop_btn.configure(state="disabled", text="停止下载")
         self.download_btn.configure(state="normal")
         self.refresh_btn.configure(state="normal")

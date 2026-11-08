@@ -1065,6 +1065,12 @@ class PixivClient:
         self.loading = True
         self.clear_tree()
         self.checked.clear()
+        if self._preview_fit_job is not None:
+            try:
+                self.root.after_cancel(self._preview_fit_job)
+            except Exception:
+                pass
+            self._preview_fit_job = None
         self._preview_sources.clear()
         self._preview_pid = None
         self._preview_last_size = None
@@ -1200,10 +1206,19 @@ class PixivClient:
             f"页数: {entry['pages']}\n"
             f"标签: {', '.join(entry['tags']) if entry['tags'] else '—'}"
         ))
+        # 切换作品时先取消上一个预览的待处理缩放，避免旧图被重新画出来
+        if self._preview_fit_job is not None:
+            try:
+                self.root.after_cancel(self._preview_fit_job)
+            except Exception:
+                pass
+            self._preview_fit_job = None
+        self._preview_pid = None
+        self._preview_last_size = None
+
         cached = self._preview_sources.get(pid)
         if cached is not None:
             self._preview_pid = pid
-            self._preview_last_size = None
             self._fit_preview()
             return
         self.preview_label.configure(text="加载预览中…", image="")
@@ -1255,6 +1270,9 @@ class PixivClient:
         self._fit_preview()
 
     def _on_preview_resize(self, _event=None):
+        # 还没有显示中的图片时不用调度缩放
+        if self._preview_pid is None:
+            return
         # 拖动窗口/分隔条时防抖，避免每像素都重算缩放
         if self._preview_fit_job is not None:
             try:
